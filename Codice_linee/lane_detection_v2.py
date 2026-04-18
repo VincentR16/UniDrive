@@ -26,7 +26,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 TOPHAT_KERNEL_SIZE = 30
-ROI_TOP_RATIO      = 0.55
+ROI_TOP_RATIO      = 0.80
 MIN_CONTOUR_AREA   = 500
 MIN_ASPECT_RATIO   = 3.0
 POLY_DEGREE        = 2
@@ -90,49 +90,141 @@ def apply_roi(mask: np.ndarray, top_ratio: float = ROI_TOP_RATIO) -> np.ndarray:
     return cv2.bitwise_and(mask, roi)
 
 
+
+def roi_left(w, h, mask):
+    left_roi = np.zeros_like(mask)
+    left_poly = np.array([[
+        (0, h),
+        (int(w * 0.05), int(h * 0.65)),
+        (int(w * 0.45), int(h * 0.65)),
+        (int(w * 0.48), h)
+    ]], dtype=np.int32)
+    cv2.fillPoly(left_roi, left_poly, 255)
+    left_mask = cv2.bitwise_and(mask, left_roi)
+    return left_mask
+
+def roi_right(w, h, mask): 
+    right_roi = np.zeros_like(mask)
+    right_poly = np.array([[
+        (int(w * 0.52), h),
+        (int(w * 0.55), int(h * 0.65)),
+        (int(w * 0.95), int(h * 0.65)),
+        (w, h)
+    ]], dtype=np.int32)
+    cv2.fillPoly(right_roi, right_poly, 255)
+    right_mask = cv2.bitwise_and(mask, right_roi)
+    return right_mask
+
+
 def find_left_right_lanes(mask: np.ndarray) -> tuple:
     """
-    Trova la migliore linea a SINISTRA e la migliore linea a DESTRA.
-    La classificazione si basa sulla posizione del centroide di ogni contorno
-    rispetto al centro dell'immagine.
-
-    Ritorna (contour_left, contour_right): ciascuno puo' essere None
-    se non ci sono linee valide in quella meta'.
+    Cerca la corsia sinistra e destra in due ROI distinte.
+    Impone un vincolo duro:
+    - LEFT deve stare nella metà sinistra dello schermo
+    - RIGHT deve stare nella metà destra dello schermo
     """
+
     h, w = mask.shape[:2]
-    image_cx = w // 2
+    image_cx = w / 2.0
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_NONE)
+    left_mask = roi_left(w, h, mask)
+    right_mask = roi_right(w, h, mask)
 
-    best_left  = (0, None)   # (area, contour)
-    best_right = (0, None)
+    def contour_bottom_x(cnt):
+        pts = cnt.reshape(-1, 2)
+        y_thresh = np.percentile(pts[:, 1], 75)
+        bottom_pts = pts[pts[:, 1] >= y_thresh]
+        if len(bottom_pts) == 0:
+            return None
+        return float(np.mean(bottom_pts[:, 0]))
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < MIN_CONTOUR_AREA:
-            continue
-        (_, (cw, ch), _) = cv2.minAreaRect(cnt)
-        if min(cw, ch) == 0:
-            continue
-        if max(cw, ch) / min(cw, ch) < MIN_ASPECT_RATIO:
-            continue
+    def select_best_contour(side_mask, side="left"):
+        contours, _ = cv2.findContours(
+            side_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+        )
 
-        # Classifica per centroide X
-        M = cv2.moments(cnt)
-        if M["m00"] == 0:
-            continue
-        cnt_cx = M["m10"] / M["m00"]
+        best_score = -1.0
+        best_cnt = None
 
-        if cnt_cx < image_cx:
-            if area > best_left[0]:
-                best_left = (area, cnt)
-        else:
-            if area > best_right[0]:
-                best_right = (area, cnt)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < MIN_CONTOUR_AREA:
+                continue
 
-    return best_left[1], best_right[1]
+            (_, (cw, ch), _) = cv2.minAreaRect(cnt)
+            if min(cw, ch) == 0:
+                continue
 
+            aspect_ratio = max(cw, ch) / min(cw, ch)
+            if aspect_ratio < MIN_ASPECT_RATIO:
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            verticality = bh / max(bw, 1)
+
+            bx = contour_bottom_x(cnt)
+            if bx is None:
+                continue
+
+            # ---- VINCOLO DURO DI LATO ----
+            if side == "left":
+                # LEFT deve stare davvero nella metà sinistra
+                if bx >= image_cx:
+                    continue
+                # opzionale: scarta anche contorni troppo centrali/destri
+                if bx > w * 0.48:
+                    continue
+                side_penalty = abs(bx - w * 0.25)
+
+            else:
+                # RIGHT deve stare davvero nella metà destra
+                if bx <= image_cx:
+                    continue
+                # opzionale: scarta anche contorni troppo centrali/sinistri
+                if bx < w * 0.52:
+                    continue
+                side_penalty = abs(bx - w * 0.75)
+
+            score = (
+                area * 1.0 +
+                aspect_ratio * 180.0 +
+                verticality * 120.0 -
+                side_penalty * 0.8
+            )
+
+            if score > best_score:
+                best_score = score
+                best_cnt = cnt
+
+        return best_cnt
+
+    left_cnt = select_best_contour(left_mask, side="left")
+    right_cnt = select_best_contour(right_mask, side="right")
+
+    # ---- CONTROLLO FINALE DURO ----
+    if left_cnt is not None:
+        lx = contour_bottom_x(left_cnt)
+        if lx is None or lx >= image_cx:
+            left_cnt = None
+
+    if right_cnt is not None:
+        rx = contour_bottom_x(right_cnt)
+        if rx is None or rx <= image_cx:
+            right_cnt = None
+
+    # Se entrambe esistono, devono essere ordinate correttamente
+    if left_cnt is not None and right_cnt is not None:
+        lx = contour_bottom_x(left_cnt)
+        rx = contour_bottom_x(right_cnt)
+
+        if lx is None or rx is None:
+            return None, None
+
+        # Vieta inversioni o linee troppo vicine
+        if lx >= rx or abs(rx - lx) < w * 0.15:
+            return None, None
+
+    return left_cnt, right_cnt
 
 def compute_center_offset(left_cnt, right_cnt, image_width: int,
                           image_height: int):
@@ -204,18 +296,12 @@ def draw_results(image: np.ndarray, left_cnt, right_cnt, offset_info) -> np.ndar
 
     # --- Linea SINISTRA (ciano) ---
     if left_cnt is not None:
-        cv2.drawContours(output, [left_cnt], -1, (255, 200, 0), 2)
+        cv2.drawContours(output, [left_cnt], -1, (0, 140, 255), 2)
         curve = fit_polynomial_curve(left_cnt)
         if curve is not None:
             cv2.polylines(output, [curve.reshape(-1, 1, 2)],
-                          isClosed=False, color=(255, 200, 0), thickness=4)
-        M = cv2.moments(left_cnt)
-        if M["m00"] > 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            cv2.putText(output, "LEFT", (cx - 30, cy - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2, cv2.LINE_AA)
+                          isClosed=False, color=(0, 140, 255), thickness=4)
+
 
     # --- Linea DESTRA (arancio) ---
     if right_cnt is not None:
@@ -224,13 +310,6 @@ def draw_results(image: np.ndarray, left_cnt, right_cnt, offset_info) -> np.ndar
         if curve is not None:
             cv2.polylines(output, [curve.reshape(-1, 1, 2)],
                           isClosed=False, color=(0, 140, 255), thickness=4)
-        M = cv2.moments(right_cnt)
-        if M["m00"] > 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            cv2.putText(output, "RIGHT", (cx - 40, cy - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        (255, 255, 255), 2, cv2.LINE_AA)
 
     # --- Indicatore di centraggio ---
     if offset_info is not None:

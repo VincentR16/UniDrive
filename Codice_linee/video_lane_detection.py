@@ -49,6 +49,8 @@ def parse_source(src: str):
     return src
 
 
+
+
 def build_debug_view(data: dict, size=(640, 360)) -> np.ndarray:
     """Pannello 2x2 compatto per vedere gli stadi durante il video."""
     def label(img, text, is_gray=False):
@@ -166,6 +168,8 @@ def run(source, save_path: str | None = None, debug: bool = False) -> None:
     if writer is not None:
         writer.release()
     cv2.destroyAllWindows()
+
+
 
 
 # ---------------------------------------------------------------------------
