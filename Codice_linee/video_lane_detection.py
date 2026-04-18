@@ -34,7 +34,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from lane_detection import process_frame
+#from lane_detection import process_frame
+from lane_detection_v2 import process_frame
 
 
 # ---------------------------------------------------------------------------
